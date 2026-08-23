@@ -244,10 +244,17 @@ def _convert_dict_to_message(_dict: Mapping[str, Any]) -> BaseMessage:
                     invalid_tool_calls.append(
                         make_invalid_tool_call(raw_tool_call, str(e))
                     )
-                if (signature := _extract_gemini_thought_signature(raw_tool_call)) and (
-                    tool_call_id := raw_tool_call.get("id")
-                ):
-                    thought_signatures[tool_call_id] = signature
+                if (
+                    signature := _extract_gemini_thought_signature(raw_tool_call)
+                ) is not None:
+                    if tool_call_id := raw_tool_call.get("id"):
+                        thought_signatures[tool_call_id] = signature
+                    else:
+                        logger.warning(
+                            "Received a Gemini thought signature for a tool call "
+                            "without an id; the signature will not be echoed back "
+                            "to the model."
+                        )
         if thought_signatures:
             additional_kwargs[_GEMINI_THOUGHT_SIGNATURES_MAP_KEY] = thought_signatures
         if audio := _dict.get("audio"):
@@ -489,11 +496,23 @@ def _convert_delta_to_message_chunk(
         except KeyError:
             pass
         thought_signatures: dict[str, str] = {}
+        index_to_tool_call_id = {
+            rtc["index"]: rtc["id"]
+            for rtc in raw_tool_calls
+            if rtc.get("id") and "index" in rtc
+        }
         for rtc in raw_tool_calls:
-            if (signature := _extract_gemini_thought_signature(rtc)) and (
-                tool_call_id := rtc.get("id")
-            ):
+            if (signature := _extract_gemini_thought_signature(rtc)) is None:
+                continue
+            tool_call_id = rtc.get("id") or index_to_tool_call_id.get(rtc.get("index"))
+            if tool_call_id:
                 thought_signatures[tool_call_id] = signature
+            else:
+                logger.warning(
+                    "Received a Gemini thought signature for a tool call chunk "
+                    "without a resolvable id; the signature will not be echoed "
+                    "back to the model."
+                )
         if thought_signatures:
             additional_kwargs[_GEMINI_THOUGHT_SIGNATURES_MAP_KEY] = thought_signatures
 
