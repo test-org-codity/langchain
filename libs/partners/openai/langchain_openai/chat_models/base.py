@@ -410,10 +410,27 @@ def _convert_message_to_dict(
                 _GEMINI_THOUGHT_SIGNATURES_MAP_KEY
             )
         ):
+            # Streamed thought signatures may have been recorded under the
+            # tool call's streaming `index` (as a string) rather than its `id`,
+            # since Gemini's thought signature is not guaranteed to arrive on
+            # the same delta as the announcing `id`. Resolve those via the
+            # index -> id correlation `tool_call_chunks` retains post-merge.
+            index_to_id: dict[str, str] = {
+                str(chunk_index): chunk_id
+                for tc_chunk in getattr(message, "tool_call_chunks", None) or []
+                if (chunk_index := tc_chunk.get("index")) is not None
+                and (chunk_id := tc_chunk.get("id"))
+            }
             for tool_call in message_dict["tool_calls"]:
-                if (
-                    signature := thought_signatures.get(tool_call.get("id"))
-                ) is not None:
+                tool_call_id = tool_call.get("id")
+                signature = thought_signatures.get(tool_call_id)
+                if signature is None:
+                    for index_key, mapped_id in index_to_id.items():
+                        if mapped_id == tool_call_id:
+                            signature = thought_signatures.get(index_key)
+                            if signature is not None:
+                                break
+                if signature is not None:
                     tool_call["extra_content"] = {
                         "google": {"thought_signature": signature}
                     }
@@ -490,9 +507,20 @@ def _convert_delta_to_message_chunk(
             pass
         thought_signatures: dict[str, str] = {}
         for rtc in raw_tool_calls:
-            if (signature := _extract_gemini_thought_signature(rtc)) and (
-                tool_call_id := rtc.get("id")
-            ):
+            if not (signature := _extract_gemini_thought_signature(rtc)):
+                continue
+            # The `id` is normally only present on the delta that first announces
+            # a tool call; later deltas for the same call only carry `index`. Fall
+            # back to `index` so a signature arriving on a later delta isn't lost.
+            index = rtc.get("index")
+            tool_call_id = rtc.get("id") or (
+                str(index) if index is not None else None
+            )
+            if tool_call_id is None:
+                continue
+            # Avoid clobbering/duplicating an already-recorded signature for this
+            # tool call within the same delta.
+            if tool_call_id not in thought_signatures:
                 thought_signatures[tool_call_id] = signature
         if thought_signatures:
             additional_kwargs[_GEMINI_THOUGHT_SIGNATURES_MAP_KEY] = thought_signatures
