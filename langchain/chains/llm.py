@@ -7,7 +7,6 @@ from pydantic import BaseModel, Extra, Field
 
 from langchain.chains.base import Chain
 from langchain.input import get_colored_text
-from langchain.output_parsers.base import OutputGuardrail
 from langchain.prompts.base import BasePromptTemplate
 from langchain.prompts.prompt import PromptTemplate
 from langchain.schema import (
@@ -15,7 +14,6 @@ from langchain.schema import (
     Guardrail,
     LLMResult,
     PromptValue,
-    ValidationError,
 )
 
 
@@ -37,7 +35,6 @@ class LLMChain(Chain, BaseModel):
     """Prompt object to use."""
     llm: BaseLanguageModel
     output_key: str = "text"  #: :meta private:
-    output_parser: Optional[OutputGuardrail] = None
     guardrails: List[Guardrail] = Field(default_factory=list)
 
     class Config:
@@ -139,14 +136,7 @@ class LLMChain(Chain, BaseModel):
     def _get_final_output(self, text: str, prompt_value: PromptValue) -> Any:
         result: Any = text
         for guardrail in self.guardrails:
-            if isinstance(guardrail, OutputGuardrail):
-                try:
-                    result = guardrail.output_parser.parse(result)
-                    error = None
-                except Exception as e:
-                    error = ValidationError(text=e)
-            else:
-                error = guardrail.check(prompt_value, result)
+            error = guardrail.check(prompt_value, result)
             if error is not None:
                 result = guardrail.fix(prompt_value, result, error)
         return result
