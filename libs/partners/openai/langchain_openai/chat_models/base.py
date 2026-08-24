@@ -194,6 +194,40 @@ WellKnownTools = (
     "tool_search",
 )
 
+# Google's OpenAI-compatible endpoint returns Gemini thought signatures on
+# tool calls via `extra_content.google.thought_signature`. The signature must
+# be echoed back on the corresponding tool call in subsequent turns.
+_GEMINI_THOUGHT_SIGNATURES_MAP_KEY = "__gemini_function_call_thought_signatures__"
+
+
+class _NonDuplicatingStr(str):
+    """A `str` that resists accidental duplication when concatenated.
+
+    `AIMessageChunk` addition merges `additional_kwargs` via
+    `langchain_core.utils._merge.merge_dicts`, which concatenates string leaves
+    with `+=`. If a provider re-emits the same Gemini thought signature on more
+    than one streamed delta for the same tool call, plain string concatenation
+    would corrupt the signature. Skip the concatenation when the two halves are
+    identical so the signature survives streaming merges intact.
+    """
+
+    def __add__(self, other: str) -> str:
+        if other == self:
+            return self
+        return _NonDuplicatingStr(str.__add__(self, other))
+
+
+def _extract_gemini_thought_signature(raw_tool_call: Mapping[str, Any]) -> str | None:
+    """Pull a Gemini thought signature off a raw OpenAI-format tool call."""
+    extra_content = raw_tool_call.get("extra_content")
+    if not isinstance(extra_content, Mapping):
+        return None
+    google = extra_content.get("google")
+    if not isinstance(google, Mapping):
+        return None
+    signature = google.get("thought_signature")
+    return signature if isinstance(signature, str) else None
+
 
 def _convert_dict_to_message(_dict: Mapping[str, Any]) -> BaseMessage:
     """Convert a dictionary to a LangChain message.
@@ -218,6 +252,7 @@ def _convert_dict_to_message(_dict: Mapping[str, Any]) -> BaseMessage:
             additional_kwargs["function_call"] = dict(function_call)
         tool_calls = []
         invalid_tool_calls = []
+        thought_signatures: dict[str, str] = {}
         if raw_tool_calls := _dict.get("tool_calls"):
             for raw_tool_call in raw_tool_calls:
                 try:
@@ -226,6 +261,12 @@ def _convert_dict_to_message(_dict: Mapping[str, Any]) -> BaseMessage:
                     invalid_tool_calls.append(
                         make_invalid_tool_call(raw_tool_call, str(e))
                     )
+                if (signature := _extract_gemini_thought_signature(raw_tool_call)) and (
+                    tool_call_id := raw_tool_call.get("id")
+                ):
+                    thought_signatures[tool_call_id] = signature
+        if thought_signatures:
+            additional_kwargs[_GEMINI_THOUGHT_SIGNATURES_MAP_KEY] = thought_signatures
         if audio := _dict.get("audio"):
             additional_kwargs["audio"] = audio
         return AIMessage(
@@ -381,6 +422,35 @@ def _convert_message_to_dict(
             message_dict["function_call"] = message.additional_kwargs["function_call"]
         else:
             pass
+        if "tool_calls" in message_dict and (
+            thought_signatures := message.additional_kwargs.get(
+                _GEMINI_THOUGHT_SIGNATURES_MAP_KEY
+            )
+        ):
+            # Streamed thought signatures may have been recorded under the
+            # tool call's streaming `index` (as a string) rather than its `id`,
+            # since Gemini's thought signature is not guaranteed to arrive on
+            # the same delta as the announcing `id`. Resolve those via the
+            # index -> id correlation `tool_call_chunks` retains post-merge.
+            index_to_id: dict[str, str] = {
+                str(chunk_index): chunk_id
+                for tc_chunk in getattr(message, "tool_call_chunks", None) or []
+                if (chunk_index := tc_chunk.get("index")) is not None
+                and (chunk_id := tc_chunk.get("id"))
+            }
+            for tool_call in message_dict["tool_calls"]:
+                tool_call_id = tool_call.get("id")
+                signature = thought_signatures.get(tool_call_id)
+                if signature is None:
+                    for index_key, mapped_id in index_to_id.items():
+                        if mapped_id == tool_call_id:
+                            signature = thought_signatures.get(index_key)
+                            if signature is not None:
+                                break
+                if signature is not None:
+                    tool_call["extra_content"] = {
+                        "google": {"thought_signature": signature}
+                    }
         # If tool calls present, content null value should be None not empty string.
         if "function_call" in message_dict or "tool_calls" in message_dict:
             message_dict["content"] = message_dict["content"] or None
@@ -452,6 +522,25 @@ def _convert_delta_to_message_chunk(
             ]
         except KeyError:
             pass
+        thought_signatures: dict[str, str] = {}
+        for rtc in raw_tool_calls:
+            if not (signature := _extract_gemini_thought_signature(rtc)):
+                continue
+            # The `id` is normally only present on the delta that first announces
+            # a tool call; later deltas for the same call only carry `index`. Fall
+            # back to `index` so a signature arriving on a later delta isn't lost.
+            index = rtc.get("index")
+            tool_call_id = rtc.get("id") or (
+                str(index) if index is not None else None
+            )
+            if tool_call_id is None:
+                continue
+            # Avoid clobbering/duplicating an already-recorded signature for this
+            # tool call within the same delta.
+            if tool_call_id not in thought_signatures:
+                thought_signatures[tool_call_id] = _NonDuplicatingStr(signature)
+        if thought_signatures:
+            additional_kwargs[_GEMINI_THOUGHT_SIGNATURES_MAP_KEY] = thought_signatures
 
     if role == "user" or default_class == HumanMessageChunk:
         return HumanMessageChunk(content=content, id=id_)
