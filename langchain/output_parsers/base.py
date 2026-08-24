@@ -34,6 +34,9 @@ class OutputGuardrail(Guardrail, BaseModel):
     output_parser: BaseOutputParser
     fixer: Fixer
 
+    class Config:
+        arbitrary_types_allowed = True
+
     def check(
         self, prompt_value: PromptValue, result: Any
     ) -> Optional[ValidationError]:
@@ -41,9 +44,9 @@ class OutputGuardrail(Guardrail, BaseModel):
             self.output_parser.parse(result)
             return None
         except Exception as e:
-            return ValidationError(text=e)
+            return ValidationError(error_message=str(e))
 
     def fix(
         self, prompt_value: PromptValue, result: Any, error: ValidationError
     ) -> Any:
-        return self.fixer(prompt_value, result, error)
+        return self.fixer.fix(prompt_value, result, error)
