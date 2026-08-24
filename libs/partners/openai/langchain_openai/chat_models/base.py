@@ -488,12 +488,25 @@ def _convert_delta_to_message_chunk(
             ]
         except KeyError:
             pass
-        thought_signatures: dict[str, str] = {}
+        thought_signatures: dict[str | int, str] = {}
         for rtc in raw_tool_calls:
-            if (signature := _extract_gemini_thought_signature(rtc)) and (
-                tool_call_id := rtc.get("id")
+            if not (signature := _extract_gemini_thought_signature(rtc)):
+                continue
+            tool_call_id = rtc.get("id")
+            if tool_call_id is None:
+                tool_call_id = rtc.get("index")
+            if tool_call_id is None:
+                continue
+            if (
+                tool_call_id in thought_signatures
+                and thought_signatures[tool_call_id] != signature
             ):
-                thought_signatures[tool_call_id] = signature
+                msg = (
+                    "Received conflicting Gemini thought signatures for tool "
+                    f"call {tool_call_id!r}."
+                )
+                raise ValueError(msg)
+            thought_signatures[tool_call_id] = signature
         if thought_signatures:
             additional_kwargs[_GEMINI_THOUGHT_SIGNATURES_MAP_KEY] = thought_signatures
 
