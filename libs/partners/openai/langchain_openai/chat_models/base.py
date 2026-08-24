@@ -200,6 +200,23 @@ WellKnownTools = (
 _GEMINI_THOUGHT_SIGNATURES_MAP_KEY = "__gemini_function_call_thought_signatures__"
 
 
+class _NonDuplicatingStr(str):
+    """A `str` that resists accidental duplication when concatenated.
+
+    `AIMessageChunk` addition merges `additional_kwargs` via
+    `langchain_core.utils._merge.merge_dicts`, which concatenates string leaves
+    with `+=`. If a provider re-emits the same Gemini thought signature on more
+    than one streamed delta for the same tool call, plain string concatenation
+    would corrupt the signature. Skip the concatenation when the two halves are
+    identical so the signature survives streaming merges intact.
+    """
+
+    def __add__(self, other: str) -> str:
+        if other == self:
+            return self
+        return _NonDuplicatingStr(str.__add__(self, other))
+
+
 def _extract_gemini_thought_signature(raw_tool_call: Mapping[str, Any]) -> str | None:
     """Pull a Gemini thought signature off a raw OpenAI-format tool call."""
     extra_content = raw_tool_call.get("extra_content")
@@ -521,7 +538,7 @@ def _convert_delta_to_message_chunk(
             # Avoid clobbering/duplicating an already-recorded signature for this
             # tool call within the same delta.
             if tool_call_id not in thought_signatures:
-                thought_signatures[tool_call_id] = signature
+                thought_signatures[tool_call_id] = _NonDuplicatingStr(signature)
         if thought_signatures:
             additional_kwargs[_GEMINI_THOUGHT_SIGNATURES_MAP_KEY] = thought_signatures
 
