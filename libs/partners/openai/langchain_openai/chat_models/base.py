@@ -194,6 +194,23 @@ WellKnownTools = (
     "tool_search",
 )
 
+# Google's OpenAI-compatible endpoint returns Gemini thought signatures on
+# tool calls via `extra_content.google.thought_signature`. The signature must
+# be echoed back on the corresponding tool call in subsequent turns.
+_GEMINI_THOUGHT_SIGNATURES_MAP_KEY = "__gemini_function_call_thought_signatures__"
+
+
+def _extract_gemini_thought_signature(raw_tool_call: Mapping[str, Any]) -> str | None:
+    """Pull a Gemini thought signature off a raw OpenAI-format tool call."""
+    extra_content = raw_tool_call.get("extra_content")
+    if not isinstance(extra_content, Mapping):
+        return None
+    google = extra_content.get("google")
+    if not isinstance(google, Mapping):
+        return None
+    signature = google.get("thought_signature")
+    return signature if isinstance(signature, str) else None
+
 
 def _convert_dict_to_message(_dict: Mapping[str, Any]) -> BaseMessage:
     """Convert a dictionary to a LangChain message.
@@ -218,6 +235,7 @@ def _convert_dict_to_message(_dict: Mapping[str, Any]) -> BaseMessage:
             additional_kwargs["function_call"] = dict(function_call)
         tool_calls = []
         invalid_tool_calls = []
+        thought_signatures: dict[str, str] = {}
         if raw_tool_calls := _dict.get("tool_calls"):
             for raw_tool_call in raw_tool_calls:
                 try:
@@ -226,6 +244,12 @@ def _convert_dict_to_message(_dict: Mapping[str, Any]) -> BaseMessage:
                     invalid_tool_calls.append(
                         make_invalid_tool_call(raw_tool_call, str(e))
                     )
+                if (signature := _extract_gemini_thought_signature(raw_tool_call)) and (
+                    tool_call_id := raw_tool_call.get("id")
+                ):
+                    thought_signatures[tool_call_id] = signature
+        if thought_signatures:
+            additional_kwargs[_GEMINI_THOUGHT_SIGNATURES_MAP_KEY] = thought_signatures
         if audio := _dict.get("audio"):
             additional_kwargs["audio"] = audio
         return AIMessage(
@@ -381,6 +405,18 @@ def _convert_message_to_dict(
             message_dict["function_call"] = message.additional_kwargs["function_call"]
         else:
             pass
+        if "tool_calls" in message_dict and (
+            thought_signatures := message.additional_kwargs.get(
+                _GEMINI_THOUGHT_SIGNATURES_MAP_KEY
+            )
+        ):
+            for tool_call in message_dict["tool_calls"]:
+                if (
+                    signature := thought_signatures.get(tool_call.get("id"))
+                ) is not None:
+                    tool_call["extra_content"] = {
+                        "google": {"thought_signature": signature}
+                    }
         # If tool calls present, content null value should be None not empty string.
         if "function_call" in message_dict or "tool_calls" in message_dict:
             message_dict["content"] = message_dict["content"] or None
@@ -452,6 +488,27 @@ def _convert_delta_to_message_chunk(
             ]
         except KeyError:
             pass
+        thought_signatures: dict[str | int, str] = {}
+        for rtc in raw_tool_calls:
+            if not (signature := _extract_gemini_thought_signature(rtc)):
+                continue
+            tool_call_id = rtc.get("id")
+            if tool_call_id is None:
+                tool_call_id = rtc.get("index")
+            if tool_call_id is None:
+                continue
+            if (
+                tool_call_id in thought_signatures
+                and thought_signatures[tool_call_id] != signature
+            ):
+                msg = (
+                    "Received conflicting Gemini thought signatures for tool "
+                    f"call {tool_call_id!r}."
+                )
+                raise ValueError(msg)
+            thought_signatures[tool_call_id] = signature
+        if thought_signatures:
+            additional_kwargs[_GEMINI_THOUGHT_SIGNATURES_MAP_KEY] = thought_signatures
 
     if role == "user" or default_class == HumanMessageChunk:
         return HumanMessageChunk(content=content, id=id_)
