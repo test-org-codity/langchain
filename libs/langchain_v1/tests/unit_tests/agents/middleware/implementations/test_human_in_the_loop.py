@@ -12,6 +12,7 @@ from langchain.agents.middleware.human_in_the_loop import (
     HumanInTheLoopMiddleware,
 )
 from langchain.agents.middleware.types import AgentState
+from langchain.tools import ToolRuntime
 
 
 def test_human_in_the_loop_middleware_initialization() -> None:
@@ -883,3 +884,231 @@ def test_human_in_the_loop_middleware_preserves_order_with_rejections() -> None:
         assert isinstance(tool_message, ToolMessage)
         assert tool_message.content == "Rejected tool B"
         assert tool_message.tool_call_id == "id_b"
+
+
+def test_interrupt_on_config_accepts_interrupt_when() -> None:
+    """`InterruptOnConfig` accepts an optional `interrupt_when` predicate."""
+    config: InterruptOnConfig = {
+        "allowed_decisions": ["approve", "reject"],
+        "interrupt_when": lambda _tc, _rt: True,
+    }
+    assert config["interrupt_when"](None, None) is True  # type: ignore[arg-type]
+
+
+def test_interrupt_when_false_auto_approves() -> None:
+    """`interrupt_when` returning `False` skips the interrupt entirely."""
+    middleware = HumanInTheLoopMiddleware(
+        interrupt_on={
+            "edit_file": {
+                "allowed_decisions": ["approve", "reject"],
+                "interrupt_when": lambda _tc, _rt: False,
+            }
+        }
+    )
+    ai_message = AIMessage(
+        content="Writing safe file",
+        tool_calls=[{"name": "edit_file", "args": {"path": "/safe/path"}, "id": "1"}],
+    )
+    state = AgentState[Any](messages=[HumanMessage(content="Hi"), ai_message])
+
+    def fail_if_called(_: Any) -> dict[str, Any]:
+        msg = "interrupt() should not be called when predicate returns False"
+        raise AssertionError(msg)
+
+    with patch(
+        "langchain.agents.middleware.human_in_the_loop.interrupt",
+        side_effect=fail_if_called,
+    ):
+        result = middleware.after_model(state, Runtime())
+
+    assert result is None
+
+
+def test_interrupt_when_true_interrupts() -> None:
+    """`interrupt_when` returning `True` interrupts with the configured decisions."""
+    middleware = HumanInTheLoopMiddleware(
+        interrupt_on={
+            "edit_file": {
+                "allowed_decisions": ["approve", "reject"],
+                "interrupt_when": lambda _tc, _rt: True,
+            }
+        }
+    )
+    ai_message = AIMessage(
+        content="Writing protected file",
+        tool_calls=[{"name": "edit_file", "args": {"path": "/etc/secret"}, "id": "1"}],
+    )
+    state = AgentState[Any](messages=[HumanMessage(content="Hi"), ai_message])
+
+    captured: dict[str, Any] = {}
+
+    def mock_approve(request: Any) -> dict[str, Any]:
+        captured["request"] = request
+        return {"decisions": [{"type": "approve"}]}
+
+    with patch(
+        "langchain.agents.middleware.human_in_the_loop.interrupt",
+        side_effect=mock_approve,
+    ):
+        result = middleware.after_model(state, Runtime())
+
+    assert result is not None
+    assert len(captured["request"]["action_requests"]) == 1
+    assert captured["request"]["action_requests"][0]["name"] == "edit_file"
+    assert captured["request"]["review_configs"][0]["allowed_decisions"] == ["approve", "reject"]
+    assert result["messages"][0].tool_calls[0]["id"] == "1"
+
+
+def test_interrupt_when_mixed_calls_same_tool() -> None:
+    """One protected-path call interrupts, one wiki call auto-approves, order preserved."""
+    middleware = HumanInTheLoopMiddleware(
+        interrupt_on={
+            "edit_file": {
+                "allowed_decisions": ["approve", "reject"],
+                "interrupt_when": lambda tc, _rt: bool(
+                    re.match(r"^/etc/", tc["args"].get("path", ""))
+                ),
+            }
+        }
+    )
+    ai_message = AIMessage(
+        content="Two writes",
+        tool_calls=[
+            {"name": "edit_file", "args": {"path": "/etc/secret"}, "id": "1"},
+            {"name": "edit_file", "args": {"path": "/wiki/page"}, "id": "2"},
+        ],
+    )
+    state = AgentState[Any](messages=[HumanMessage(content="Hi"), ai_message])
+
+    captured: dict[str, Any] = {}
+
+    def mock_approve(request: Any) -> dict[str, Any]:
+        captured["request"] = request
+        return {"decisions": [{"type": "approve"}]}
+
+    with patch(
+        "langchain.agents.middleware.human_in_the_loop.interrupt",
+        side_effect=mock_approve,
+    ):
+        result = middleware.after_model(state, Runtime())
+
+    assert len(captured["request"]["action_requests"]) == 1
+    assert captured["request"]["action_requests"][0]["args"] == {"path": "/etc/secret"}
+
+    assert result is not None
+    revised = result["messages"][0].tool_calls
+    assert [tc["id"] for tc in revised] == ["1", "2"]
+    assert [tc["args"]["path"] for tc in revised] == ["/etc/secret", "/wiki/page"]
+
+
+def test_interrupt_when_mixed_configured_tools() -> None:
+    """Unlisted, listed-with-false, and listed-with-true tools all behave correctly."""
+    middleware = HumanInTheLoopMiddleware(
+        interrupt_on={
+            "edit_file": {
+                "allowed_decisions": ["approve"],
+                "interrupt_when": lambda _tc, _rt: False,
+            },
+            "delete_file": {
+                "allowed_decisions": ["approve", "reject"],
+                "interrupt_when": lambda _tc, _rt: True,
+            },
+        }
+    )
+    ai_message = AIMessage(
+        content="Three calls",
+        tool_calls=[
+            {"name": "search", "args": {"q": "x"}, "id": "1"},
+            {"name": "edit_file", "args": {"path": "/wiki/page"}, "id": "2"},
+            {"name": "delete_file", "args": {"path": "/wiki/page"}, "id": "3"},
+        ],
+    )
+    state = AgentState[Any](messages=[HumanMessage(content="Hi"), ai_message])
+
+    captured: dict[str, Any] = {}
+
+    def mock_approve(request: Any) -> dict[str, Any]:
+        captured["request"] = request
+        return {"decisions": [{"type": "approve"}]}
+
+    with patch(
+        "langchain.agents.middleware.human_in_the_loop.interrupt",
+        side_effect=mock_approve,
+    ):
+        result = middleware.after_model(state, Runtime())
+
+    assert [a["name"] for a in captured["request"]["action_requests"]] == ["delete_file"]
+    assert result is not None
+    revised = result["messages"][0].tool_calls
+    assert [tc["id"] for tc in revised] == ["1", "2", "3"]
+
+
+def test_interrupt_when_tool_runtime_fields() -> None:
+    """Predicate receives a `ToolRuntime` with correct fields and documented deviations."""
+    captured: dict[str, Any] = {}
+
+    def capture_predicate(tc: ToolCall, rt: ToolRuntime[Any, Any]) -> bool:
+        captured["tool_call"] = tc
+        captured["runtime"] = rt
+        return False
+
+    middleware = HumanInTheLoopMiddleware(
+        interrupt_on={
+            "edit_file": {
+                "allowed_decisions": ["approve"],
+                "interrupt_when": capture_predicate,
+            }
+        }
+    )
+    ai_message = AIMessage(
+        content="One call",
+        tool_calls=[{"name": "edit_file", "args": {"path": "/x"}, "id": "abc"}],
+    )
+    state = AgentState[Any](messages=[HumanMessage(content="Hi"), ai_message])
+
+    sentinel_context = object()
+    sentinel_store = object()
+    runtime = Runtime(context=sentinel_context, store=sentinel_store)  # type: ignore[arg-type]
+
+    middleware.after_model(state, runtime)
+
+    rt = captured["runtime"]
+    assert rt.tool_call_id == "abc"
+    assert rt.state is state
+    assert rt.context is sentinel_context
+    assert rt.store is sentinel_store
+    assert rt.stream_writer is runtime.stream_writer
+    assert rt.tools == []
+    assert rt.config == {}
+    assert rt.execution_info is None
+    assert rt.server_info is None
+    assert captured["tool_call"]["id"] == "abc"
+    assert captured["tool_call"]["args"] == {"path": "/x"}
+
+
+def test_interrupt_when_exceptions_propagate() -> None:
+    """A predicate that raises propagates the exception (no silent auto-approval)."""
+
+    class PredicateBugError(RuntimeError):
+        pass
+
+    def bad_predicate(_tc: Any, _rt: Any) -> bool:
+        msg = "kaboom"
+        raise PredicateBugError(msg)
+
+    middleware = HumanInTheLoopMiddleware(
+        interrupt_on={
+            "edit_file": {
+                "allowed_decisions": ["approve"],
+                "interrupt_when": bad_predicate,
+            }
+        }
+    )
+    ai_message = AIMessage(
+        content="One call",
+        tool_calls=[{"name": "edit_file", "args": {"path": "/x"}, "id": "1"}],
+    )
+    state = AgentState[Any](messages=[HumanMessage(content="Hi"), ai_message])
+
+    with pytest.raises(PredicateBugError, match="kaboom"):
+        middleware.after_model(state, Runtime())

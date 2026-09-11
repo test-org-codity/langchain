@@ -1,4 +1,4 @@
-"""Human in the loop middleware."""
+   """Human in the loop middleware."""
 
 from typing import Any, Literal, Protocol
 
@@ -14,6 +14,7 @@ from langchain.agents.middleware.types import (
     ResponseT,
     StateT,
 )
+from langchain.tools import ToolRuntime
 
 
 class Action(TypedDict):
@@ -130,6 +131,18 @@ class _DescriptionFactory(Protocol):
         ...
 
 
+class _InterruptWhen(Protocol):
+    """Predicate that decides whether a tool call should trigger an interrupt."""
+
+    def __call__(
+        self,
+        tool_call: ToolCall,
+        runtime: ToolRuntime[ContextT, Any],
+    ) -> bool:
+        """Return `True` to interrupt this tool call, `False` to auto-approve it."""
+        ...
+
+
 class InterruptOnConfig(TypedDict):
     """Configuration for an action requiring human in the loop.
 
@@ -178,6 +191,24 @@ class InterruptOnConfig(TypedDict):
     args_schema: NotRequired[dict[str, Any]]
     """JSON schema for the args associated with the action, if edits are allowed."""
 
+    interrupt_when: NotRequired[_InterruptWhen]
+    """Optional predicate gating whether this tool call triggers an interrupt.
+
+    Called with the proposed `ToolCall` and a `ToolRuntime` constructed by the
+    middleware. Return `True` to interrupt (with this config's `allowed_decisions`)
+    or `False` to auto-approve the call as if the tool were not listed in
+    `interrupt_on`.
+
+    Predicates must be synchronous and deterministic — LangGraph interrupt replay
+    on resume requires the same interrupts to fire on each evaluation. Exceptions
+    propagate.
+
+    Note: the `ToolRuntime` constructed for predicate evaluation has three
+    deviations from a tool-time `ToolRuntime`: `tools=[]`, `config={}`, and
+    `execution_info`/`server_info=None`. Predicates should rely on `state`,
+    `tool_call_id`, `context`, and `store` rather than these fields.
+    """
+
 
 class HumanInTheLoopMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
     """Human in the loop middleware."""
@@ -201,8 +232,15 @@ class HumanInTheLoopMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
                 * `InterruptOnConfig` indicates the specific decisions allowed for this
                     tool.
 
-                    The `InterruptOnConfig` can include a `description` field (`str` or
-                    `Callable`) for custom formatting of the interrupt description.
+                    The `InterruptOnConfig` can include:
+                    - a `description` field (`str` or `Callable`) for custom formatting
+                      of the interrupt description, and
+                    - an `interrupt_when` predicate `(ToolCall, ToolRuntime) -> bool`.
+                      When set, only calls for which the predicate returns `True`
+                      interrupt. Calls returning `False` are auto-approved exactly as
+                      if the tool were not listed in `interrupt_on`. Predicates must be
+                      synchronous and deterministic (LangGraph interrupt replay re-runs
+                      them on resume).
             description_prefix: The prefix to use when constructing action requests.
 
                 This is used to provide context about the tool call and the action being
@@ -222,6 +260,34 @@ class HumanInTheLoopMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
                 resolved_configs[tool_name] = tool_config
         self.interrupt_on = resolved_configs
         self.description_prefix = description_prefix
+
+    def _should_interrupt(
+        self,
+        tool_call: ToolCall,
+        config: InterruptOnConfig,
+        state: AgentState[Any],
+        runtime: Runtime[ContextT],
+    ) -> bool:
+        """Evaluate the per-call predicate, if any.
+
+        Returns `True` when the call should interrupt, `False` to auto-approve.
+        When no `interrupt_when` is configured, returns `True` (unchanged behavior).
+        """
+        interrupt_when = config.get("interrupt_when")
+        if interrupt_when is None:
+            return True
+        tool_runtime: ToolRuntime[ContextT, Any] = ToolRuntime(
+            state=state,
+            context=runtime.context,
+            config={},
+            stream_writer=runtime.stream_writer,
+            tool_call_id=tool_call["id"],
+            store=runtime.store,
+            tools=[],
+            execution_info=None,
+            server_info=None,
+        )
+        return interrupt_when(tool_call, tool_runtime)
 
     def _create_action_and_config(
         self,
@@ -340,13 +406,17 @@ class HumanInTheLoopMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
         interrupt_indices: list[int] = []
 
         for idx, tool_call in enumerate(last_ai_msg.tool_calls):
-            if (config := self.interrupt_on.get(tool_call["name"])) is not None:
-                action_request, review_config = self._create_action_and_config(
-                    tool_call, config, state, runtime
-                )
-                action_requests.append(action_request)
-                review_configs.append(review_config)
-                interrupt_indices.append(idx)
+            config = self.interrupt_on.get(tool_call["name"])
+            if config is None:
+                continue
+            if not self._should_interrupt(tool_call, config, state, runtime):
+                continue
+            action_request, review_config = self._create_action_and_config(
+                tool_call, config, state, runtime
+            )
+            action_requests.append(action_request)
+            review_configs.append(review_config)
+            interrupt_indices.append(idx)
 
         # If no interrupts needed, return early
         if not action_requests:
