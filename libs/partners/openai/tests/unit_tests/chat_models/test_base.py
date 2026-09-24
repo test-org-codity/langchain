@@ -66,6 +66,7 @@ from langchain_openai.chat_models._compat import (
     _convert_to_v03_ai_message,
 )
 from langchain_openai.chat_models.base import (
+    _GEMINI_THOUGHT_SIGNATURES_MAP_KEY,
     OpenAIRefusalError,
     _construct_lc_result_from_responses_api,
     _construct_responses_api_input,
@@ -785,6 +786,127 @@ def test_function_calls_with_tool_calls(mock_client: MagicMock) -> None:
         tool_call_message_payload = call_messages[1]
         assert "function_call" in tool_call_message_payload
         assert "tool_calls" not in tool_call_message_payload
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_gemini_thought_signature_roundtrip(streaming: bool) -> None:
+    """Gemini thought signatures should survive a tool-calling round trip.
+
+    Google's OpenAI-compatible endpoint returns `extra_content.google.thought_signature`
+    on tool calls. The signature must be echoed back on the same tool call in
+    subsequent turns or the model errors out, so we stash a `{id: signature}` map on
+    `additional_kwargs[_GEMINI_THOUGHT_SIGNATURES_MAP_KEY]` and re-inject it on send.
+    """
+    tool_call = {
+        "id": "tc_1",
+        "type": "function",
+        "function": {"name": "greet", "arguments": "{}"},
+        "extra_content": {"google": {"thought_signature": "SIG_A"}},
+    }
+    non_streaming_response = {
+        "id": "resp_1",
+        "object": "chat.completion",
+        "model": "gemini-3-flash-preview",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [tool_call],
+                },
+            }
+        ],
+    }
+    streaming_chunks = [
+        {
+            "id": "resp_1",
+            "object": "chat.completion.chunk",
+            "model": "gemini-3-flash-preview",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{"index": 0, **tool_call}],
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "resp_1",
+            "object": "chat.completion.chunk",
+            "model": "gemini-3-flash-preview",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        },
+    ]
+
+    captured: dict[str, Any] = {}
+
+    def configure_mock(client: MagicMock) -> None:
+        if streaming:
+
+            def mock_create(*args: Any, **kwargs: Any) -> MockSyncContextManager:
+                captured["kwargs"] = kwargs
+                return MockSyncContextManager(streaming_chunks)
+
+            client.create = mock_create
+        else:
+
+            def mock_with_raw_create(*args: Any, **kwargs: Any) -> MagicMock:
+                captured["kwargs"] = kwargs
+                resp = MagicMock()
+                resp.parse.return_value = non_streaming_response
+                resp.headers = {}
+                return resp
+
+            client.with_raw_response.create = mock_with_raw_create
+
+    llm = ChatOpenAI(model="gemini-3-flash-preview")
+    mock_client = MagicMock()
+    configure_mock(mock_client)
+
+    # Turn 1: parse signature off the response.
+    with patch.object(llm, "client", mock_client):
+        if streaming:
+            chunks = list(llm.stream("Use the greet tool"))
+            assistant_message: AIMessage = chunks[0]
+            for chunk in chunks[1:]:
+                assistant_message = assistant_message + chunk  # type: ignore[assignment]
+        else:
+            assistant_message = cast(AIMessage, llm.invoke("Use the greet tool"))
+
+    assert assistant_message.additional_kwargs.get(
+        _GEMINI_THOUGHT_SIGNATURES_MAP_KEY
+    ) == {"tc_1": "SIG_A"}
+    assert assistant_message.tool_calls
+    assert assistant_message.tool_calls[0]["id"] == "tc_1"
+
+    # Turn 2: confirm the signature is re-attached on the outgoing payload.
+    captured.clear()
+    configure_mock(mock_client)
+    history: list[BaseMessage] = [
+        HumanMessage("Use the greet tool"),
+        assistant_message,
+        ToolMessage(content="hello", tool_call_id="tc_1"),
+    ]
+    with patch.object(llm, "client", mock_client):
+        if streaming:
+            list(llm.stream(history))
+        else:
+            llm.invoke(history)
+
+    sent_messages = captured["kwargs"]["messages"]
+    sent_assistant = sent_messages[1]
+    assert sent_assistant["role"] == "assistant"
+    sent_tool_calls = sent_assistant["tool_calls"]
+    assert sent_tool_calls[0]["id"] == "tc_1"
+    assert sent_tool_calls[0]["extra_content"] == {
+        "google": {"thought_signature": "SIG_A"}
+    }
 
 
 def test_custom_token_counting() -> None:
